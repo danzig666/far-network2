@@ -40,7 +40,7 @@ def main():
         print('still scanning:', 'Esc]' in far.screen(), flush=True)
 
         far.wait_for(lambda s: 'Esc]' not in s, 120, 'scan to end')
-        print(f'scan over after {time.monotonic() - start:.1f}s (legacy browser gave up)', flush=True)
+        print(f'scan over after {time.monotonic() - start:.1f}s ', flush=True)
         found = computers(far.screen())
         print(f'final: {len(found)} computers: {found}', flush=True)
         for line in far.screen().splitlines()[2:18]:

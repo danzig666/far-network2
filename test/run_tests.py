@@ -155,6 +155,12 @@ def test_hung_network(far_dir):
         far.press('esc')
         far.wait_for(lambda s: 'zzqx' not in s, 3, 'command line to clear')
 
+        # The folder the plugin opens in was reached without going through its parent.
+        far.press('home')
+        far.press('enter')
+        t = far.wait_for(lambda s: 'Microsoft Windows Network' in s.splitlines()[0], 3, 'the network above the domain')
+        check('".." from the opening folder needs no network', 'Please wait' not in far.screen() and t < RESPONSIVE, f'{t:.3f}s')
+
         # The workers are still stuck in "network calls". Quitting must not wait for them or crash.
         quit_far(far)
         t = far.wait_exit(10)

@@ -1336,6 +1336,40 @@ bool NetBrowser::GetResourceParent(const NetResource& SrcRes, NetResource* DstNe
 		return true;
 	}
 
+	// We can work these out by ourselves. Asking would mean waiting for the legacy browser,
+	// which on most networks is no longer there to answer.
+	if (SrcRes.lpProvider.find(L"Microsoft Windows") != string::npos)
+	{
+		if (SrcRes.dwDisplayType == RESOURCEDISPLAYTYPE_NETWORK)
+			return false;
+
+		if (SrcRes.dwDisplayType == RESOURCEDISPLAYTYPE_DOMAIN)
+		{
+			if (DstNetResource)
+			{
+				*DstNetResource = {};
+				DstNetResource->dwScope = RESOURCE_GLOBALNET;
+				DstNetResource->dwType = RESOURCETYPE_ANY;
+				DstNetResource->dwDisplayType = RESOURCEDISPLAYTYPE_NETWORK;
+				DstNetResource->dwUsage = RESOURCEUSAGE_CONTAINER;
+				DstNetResource->lpRemoteName = SrcRes.lpProvider;
+				DstNetResource->lpProvider = SrcRes.lpProvider;
+			}
+
+			return true;
+		}
+	}
+
+	// A server we got to directly, by name. Most likely it's in our own network, and
+	// finding out for sure can take a minute.
+	if (SrcRes.dwDisplayType == RESOURCEDISPLAYTYPE_SERVER && Scanner::FindLocalNetwork(Parent))
+	{
+		if (DstNetResource)
+			*DstNetResource = std::move(Parent);
+
+		return true;
+	}
+
 	if (!Opt.ScanNetwork)
 		return false;
 
