@@ -200,11 +200,50 @@ def test_hung_first_open(far_dir, work):
         far.kill()
 
 
+def test_slow_legacy_browser(far_dir, work):
+    # Discovery answers at once, and the legacy browser takes its time but does find something.
+    shutil.rmtree(os.path.join(work, 'Profile'), ignore_errors=True)
+    far = Far(far_dir, {'FARNET_TEST_SERVERS': '3', 'FARNET_TEST_DELAY_MS': '1500', 'FARNET_TEST_DISCOVERY': '1'})
+    try:
+        open_network(far)
+        far.wait_for(lambda s: 'DISC000' in s, 10, 'discovered computer')
+        t = far.wait_for(lambda s: 'Esc]' not in s, 1, 'scanning status to go')
+        check('scanning ends with discovery', fakes(far.screen()) < 3, f'{t:.3f}s, {fakes(far.screen())} of 3 from the legacy browser so far')
+        t = far.wait_for(lambda s: fakes(s) == 3, 15, 'legacy results')
+        check('the legacy results are added without a scanning status', 'DISC000' in far.screen() and 'Esc]' not in far.screen(), f'{t:.2f}s later')
+        time.sleep(2)
+        check('the list stays complete once the legacy browser is done', fakes(far.screen()) == 3 and 'DISC000' in far.screen())
+        quit_far(far)
+        far.wait_exit(10)
+    finally:
+        far.kill()
+
+    # Quitting before the legacy browser is done must not cost us the list.
+    far = Far(far_dir, {'FARNET_TEST_SERVERS': '3', 'FARNET_TEST_DELAY_MS': '600000', 'FARNET_TEST_DISCOVERY': '1'})
+    try:
+        open_network(far)
+        far.wait_for(lambda s: 'DISC000' in s and fakes(s) == 3 and 'Esc]' not in s, 5, 'cached list and discovery')
+        quit_far(far)
+        far.wait_exit(10)
+        check('quitting while the legacy browser hangs is clean', far.proc.returncode == 0, f'code {far.proc.returncode}')
+    finally:
+        far.kill()
+
+    far = Far(far_dir, {'FARNET_TEST_SERVERS': '3', 'FARNET_TEST_DELAY_MS': '600000', 'FARNET_TEST_DISCOVERY': '1'})
+    try:
+        open_network(far)
+        t = far.wait_for(lambda s: 'DISC000' in s, 2, 'saved list')
+        check('...and keeps the list', fakes(far.screen()) == 3, f'{t:.3f}s')
+    finally:
+        far.kill()
+
+
 def main():
     src, work = sys.argv[1], sys.argv[2]
     make_far(src, work)
     for test in (lambda: test_incremental_and_responsive(work), lambda: test_navigation_and_cache(work),
-                 lambda: test_hung_network(work), lambda: test_hung_first_open(work, work)):
+                 lambda: test_hung_network(work), lambda: test_hung_first_open(work, work),
+                 lambda: test_slow_legacy_browser(work, work)):
         try:
             test()
         except Exception as e:

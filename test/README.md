@@ -19,6 +19,7 @@ replaces the network with a fake one controlled by environment variables:
 |---|---|
 | `FARNET_TEST_SERVERS` | Number of fake servers. Setting it turns the fake on. |
 | `FARNET_TEST_DELAY_MS` | How long every "network call" takes. 600000 stands in for a hung provider. |
+| `FARNET_TEST_DISCOVERY` | Set to 1 to have discovery find `\\\\DISC000` at once and the fake servers come from the slow legacy browser. |
 
 Never install this DLL. The release builds don't contain the hooks.
 

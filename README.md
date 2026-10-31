@@ -21,7 +21,7 @@ Measured on a LAN with no browse server, opening the network from cold:
 | | Stock | This one |
 |---|---|---|
 | Far reacts to a key | 97-99 s | 0.02-0.08 s |
-| First computer on screen | never: the legacy browser finds nothing there | under 0.5 s |
+| First computer on screen | never: the legacy browser finds nothing there | about 0.2-1 s |
 | List on screen after a restart | never, same reason | 0.03 s |
 
 ## Install
@@ -63,9 +63,10 @@ installed, and the existing language files, help and settings keep working.
 - Windows has no way to interrupt a blocked network call. Cancelling means Far stops
   waiting, and the abandoned call ends in the background, whenever Windows lets it.
   Quitting Far doesn't wait for it.
-- The legacy browser is still asked, so the title can say "Scanning" for a while with
-  the list already complete: 40-odd seconds on the first scan if there's no browse
-  server. It isn't asked again for 24 hours after it fails, unless you press Ctrl+R.
+- The legacy browser is still asked, quietly in the background, because some machines
+  only show up that way. Scanning doesn't wait for it, and anything it finds is added
+  to the list when it turns up. That can be a minute later. It isn't asked again for
+  24 hours after it fails, unless you press Ctrl+R.
 - Opening a domain or the Windows network now sends a WS-Discovery multicast probe,
   as Explorer does, and asks each responding computer for its name over HTTP.
   **Scan network** in the plugin's settings turns this off along with the rest of

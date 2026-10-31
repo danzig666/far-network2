@@ -762,6 +762,12 @@ namespace Scanner
 
 	static bool IsWindowsNetworkFolder(const Request& Req)
 	{
+#ifdef NETWORK_TEST_HOOKS
+		// With the fake network, the fake browser is the scan, unless the test is about discovery.
+		if (TestHooks::Fake() && !TestHooks::Env(L"FARNET_TEST_DISCOVERY"))
+			return false;
+#endif
+
 		return Req.HasResource &&
 			(Req.Resource.dwDisplayType == RESOURCEDISPLAYTYPE_DOMAIN || Req.Resource.dwDisplayType == RESOURCEDISPLAYTYPE_NETWORK) &&
 			Req.Resource.lpProvider.find(L"Microsoft Windows") != string::npos;
@@ -814,6 +820,7 @@ namespace Scanner
 #ifdef NETWORK_TEST_HOOKS
 		if (TestHooks::Fake())
 		{
+			Job->Add({MakeDiscovered(*Req, RESOURCEDISPLAYTYPE_SERVER, L"\\\\DISC000", L"")});
 			Job->Finish(NO_ERROR);
 			return;
 		}
@@ -895,6 +902,12 @@ namespace Scanner
 		std::shared_ptr<ScanJob> Job;
 		unsigned long long JobSequence = 0;
 		ULONGLONG JobStarted = 0;
+
+		// The legacy browser can take a minute to tell us that it isn't there, and nobody should have
+		// to watch that. It doesn't hold up the scan: whatever it finds is added as it turns up.
+		std::shared_ptr<ScanJob> LateJob;
+		unsigned long long LateSequence = 0;
+		std::vector<NetResource> ScanItems; // what the scan itself found
 	};
 
 	struct ParentEntry
@@ -1205,6 +1218,19 @@ namespace Scanner
 
 	static void CancelEntry(Entry& Item)
 	{
+		if (Item.LateJob)
+		{
+			Item.LateJob->Cancelled = true;
+
+			if (!Item.Job)
+			{
+				Item.Items = Merged(Item.LateJob->Take().Items, Item.Items);
+				Touch(Item);
+			}
+
+			Item.LateJob.reset();
+		}
+
 		if (!Item.Job)
 			return;
 
@@ -1266,12 +1292,18 @@ namespace Scanner
 		else if (IsWindowsNetworkFolder(Req))
 		{
 			auto Shared = std::make_shared<const Request>(Req);
-			const auto AskLegacyBrowser = Force || SecondsNow() - LegacyBrowserFailed.load() >= LegacyBrowserRetrySeconds;
-			Job->Workers = AskLegacyBrowser? 2 : 1;
 			Started = true;
 
-			if (AskLegacyBrowser && !StartWorker([Job, Shared]{ ScanFolder(Job, *Shared); }))
-				Job->Finish(NO_ERROR);
+			if (!Item.LateJob && (Force || SecondsNow() - LegacyBrowserFailed.load() >= LegacyBrowserRetrySeconds))
+			{
+				auto Late = std::make_shared<ScanJob>();
+
+				if (StartWorker([Late, Shared]{ ScanFolder(Late, *Shared); }))
+				{
+					Item.LateJob = std::move(Late);
+					Item.LateSequence = 0;
+				}
+			}
 
 			if (!StartWorker([Job, Shared]{ DiscoverComputers(Job, Shared); }))
 				Job->Finish(NO_ERROR);
@@ -1295,40 +1327,66 @@ namespace Scanner
 		{
 			auto& Item = i.second;
 
-			if (!Item.Job)
-				continue;
-
-			const auto Sequence = Item.Job->Sequence();
-
-			if (Sequence != Item.JobSequence)
+			if (Item.Job)
 			{
-				Item.JobSequence = Sequence;
-				Touch(Item);
+				const auto Sequence = Item.Job->Sequence();
+
+				if (Sequence != Item.JobSequence)
+				{
+					Item.JobSequence = Sequence;
+					Touch(Item);
+				}
+
+				if (Item.Job->Finished())
+				{
+					auto Result = Item.Job->Take();
+
+					if (Result.Error != NO_ERROR)
+					{
+						// Don't throw away a list we have because of a failed refresh.
+						Item.Items = Merged(Result.Items, Item.Items);
+						Item.Complete = false;
+						Item.Error = Result.Error;
+					}
+					else
+					{
+						if (Item.LateJob)
+						{
+							// Things only the legacy browser knows about stay until it has spoken.
+							Item.ScanItems = Result.Items;
+							Item.Items = Merged(Result.Items, Item.Items);
+						}
+						else
+							Item.Items = std::move(Result.Items);
+
+						Item.Complete = true;
+						Item.Error = 0;
+					}
+
+					Item.Stale = false;
+					Item.Updated = GetTickCount64();
+					Item.Job.reset();
+					Touch(Item);
+				}
 			}
 
-			if (!Item.Job->Finished())
-				continue;
-
-			auto Result = Item.Job->Take();
-
-			if (Result.Error == NO_ERROR)
+			if (Item.LateJob && !Item.Job)
 			{
-				Item.Items = std::move(Result.Items);
-				Item.Complete = true;
-				Item.Error = 0;
-			}
-			else
-			{
-				// Don't throw away a list we have because of a failed refresh.
-				Item.Items = Merged(Result.Items, Item.Items);
-				Item.Complete = false;
-				Item.Error = Result.Error;
-			}
+				auto Late = Item.LateJob->Take();
 
-			Item.Stale = false;
-			Item.Updated = GetTickCount64();
-			Item.Job.reset();
-			Touch(Item);
+				if (Late.Sequence != Item.LateSequence)
+				{
+					Item.LateSequence = Late.Sequence;
+					Item.Items = Late.Finished? Merged(Item.ScanItems, Late.Items) : Merged(Item.Items, Late.Items);
+					Touch(Item);
+				}
+
+				if (Late.Finished)
+				{
+					Item.LateJob.reset();
+					Touch(Item);
+				}
+			}
 		}
 
 		if (S->ConnectedJob)
@@ -1377,6 +1435,12 @@ namespace Scanner
 		}
 	}
 
+	// With an empty list the legacy browser is still our only hope, so it does count then.
+	static bool IsSearching(const Entry& Item)
+	{
+		return Item.Job || (Item.LateJob && Item.Items.empty());
+	}
+
 	View Acquire(const Request& Req, bool Force, bool Navigated)
 	{
 		Pump();
@@ -1413,7 +1477,7 @@ namespace Scanner
 		}
 
 		View Result;
-		Result.Running = Item.Job != nullptr;
+		Result.Running = IsSearching(Item);
 		Result.Error = Item.Error;
 		Result.Items = Item.Job? Merged(Item.Job->Take().Items, Item.Items) : Item.Items;
 		Result.Version = Item.Version;
@@ -1433,7 +1497,7 @@ namespace Scanner
 	bool IsRunning(const string& Key)
 	{
 		const auto Found = S->Entries.find(Key);
-		return Found != S->Entries.end() && Found->second.Job;
+		return Found != S->Entries.end() && IsSearching(Found->second);
 	}
 
 	bool IsFresh(const string& Key)
@@ -1448,7 +1512,7 @@ namespace Scanner
 	{
 		const auto Found = S->Entries.find(Key);
 
-		if (Found == S->Entries.end() || !Found->second.Job)
+		if (Found == S->Entries.end() || !IsSearching(Found->second))
 			return false;
 
 		CancelEntry(Found->second);
@@ -1493,10 +1557,10 @@ namespace Scanner
 	{
 		const auto Found = S->Entries.find(Key);
 
-		if (Found == S->Entries.end() || !Found->second.Job)
+		if (Found == S->Entries.end() || !IsSearching(Found->second))
 			return true;
 
-		const auto Job = Found->second.Job;
+		const auto Job = Found->second.Job? Found->second.Job : Found->second.LateJob;
 
 		if (!WaitCancellable([&Job]{ return Job->Finished(); }))
 		{
