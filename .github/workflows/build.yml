@@ -1,0 +1,77 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tag has to say what the DLL says about itself.
+      - name: Check the tag against the plugin version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $build = (Select-String -Path src/version.hpp -Pattern '#define PLUGIN_BUILD (\d+)').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v3.0.$build") {
+            throw "Tag $env:GITHUB_REF_NAME doesn't match PLUGIN_BUILD $build, expected v3.0.$build"
+          }
+
+      # "test" also compiles the test hooks. That DLL goes to build\testdll and is never packaged.
+      - name: Build
+        shell: cmd
+        run: build.cmd test
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $name = "far-network2-$version"
+          New-Item -ItemType Directory -Force package/$name, symbols/$name | Out-Null
+          Copy-Item install.ps1, README.md, LICENSE package/$name
+          foreach ($arch in 'x64', 'x86') {
+            New-Item -ItemType Directory -Force package/$name/$arch, symbols/$name/$arch | Out-Null
+            Copy-Item dist/$arch/Network.dll, dist/$arch/Network.map package/$name/$arch
+            Copy-Item dist/$arch/Network.pdb symbols/$name/$arch
+          }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Compress-Archive -Path package/$name/* -DestinationPath out/$name.zip
+          Compress-Archive -Path symbols/$name/* -DestinationPath out/$name-symbols.zip
+          Get-ChildItem out -Filter *.zip | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content out/SHA256SUMS.txt -Encoding ascii
+          Get-Content out/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: far-network2
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: far-network2
+          path: out
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/* --title "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md --verify-tag
