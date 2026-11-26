@@ -28,9 +28,11 @@ Never install this DLL. The release builds don't contain the hooks.
 Stock DLL with an existing profile and plugin cache, then `install.ps1`, then
 `-Uninstall`. Needs a LAN with at least one computer that answers WS-Discovery.
 
-## `real_lan.py`, `compare_real.py` and `parent_timing.py`: your network
+## `real_lan.py`, `enter_computer.py`, `compare_real.py` and `parent_timing.py`: your network
 
 `real_lan.py` tries the release DLL from cold and browses into this computer only.
+`enter_computer.py` presses Enter on a computer you name and reports how long it took to
+show shares, a password prompt or an error (it never types a password).
 `compare_real.py` times the stock DLL against the new one. `parent_timing.py` times
 `..` from the folder the plugin opens in. All of them depend on the LAN, so they report
 numbers rather than pass or fail.

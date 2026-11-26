@@ -30,7 +30,7 @@ call "%VCVARS%" %ARCH% >nul || exit /b 1
 pushd "%~dp0src"
 cl /nologo /c /std:c++17 /utf-8 /EHsc /O2 /MT /W3 /GS /Gy /Zi /permissive- /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /D_CRT_NONSTDC_NO_WARNINGS /D_CRT_NON_CONFORMING_SWPRINTFS /D_WIN32_WINNT=0x0601 %EXTRA% /I..\sdk /I. /Fo"%OBJ%\\" /Fd"%OBJ%\vc.pdb" Network.cpp NetCfg.cpp NetClass.cpp NetCommon.cpp NetFavorites.cpp NetScan.cpp NetDiscovery.cpp || (popd & exit /b 1)
 rc /nologo /I..\sdk /I. /dUNICODE /fo"%OBJ%\Network.res" Network.rc || (popd & exit /b 1)
-link /nologo /DLL /OPT:REF /OPT:ICF /DEBUG /DEF:Network.vc.def /MAP:"%OUT%\Network.map" /PDB:"%OUT%\Network.pdb" /IMPLIB:"%OBJ%\Network.lib" /OUT:"%OUT%\Network.dll" "%OBJ%\*.obj" "%OBJ%\Network.res" mpr.lib netapi32.lib user32.lib advapi32.lib ws2_32.lib winhttp.lib rpcrt4.lib || (popd & exit /b 1)
+link /nologo /DLL /OPT:REF /OPT:ICF /DEBUG /DEF:Network.vc.def /MAP:"%OUT%\Network.map" /PDB:"%OUT%\Network.pdb" /IMPLIB:"%OBJ%\Network.lib" /OUT:"%OUT%\Network.dll" "%OBJ%\*.obj" "%OBJ%\Network.res" mpr.lib netapi32.lib user32.lib advapi32.lib ws2_32.lib winhttp.lib rpcrt4.lib iphlpapi.lib || (popd & exit /b 1)
 popd
 echo Built %OUT%\Network.dll
 endlocal

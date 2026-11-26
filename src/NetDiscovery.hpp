@@ -31,6 +31,20 @@ namespace Discovery
 
 	// Asks a responder for its name. Takes a few seconds at most.
 	Computer Identify(const Responder& Target);
+
+	// Asks every address of the local IPv4 subnets for its NetBIOS names. Finds the computers
+	// that share files but have network discovery turned off, which WS-Discovery can't see.
+	// Takes about two seconds. Only computers running the file server service are reported.
+	void NetBiosSweep(const std::function<bool()>& IsCancelled, const std::function<void(Computer&&, std::wstring&& Address)>& Found);
+
+	// Where a computer was last seen answering, so that reaching it doesn't depend on name resolution.
+	void RememberAddress(const std::wstring& Name, const std::wstring& Address);
+
+	// Whether the computer accepts connections on the SMB ports (445 or 139) within TimeoutMs.
+	// A firewall that drops them leaves Windows waiting for half a minute or more per attempt
+	// before it says ERROR_BAD_NETPATH. Returns true when it can't tell, such as when the name
+	// doesn't resolve: then it's up to Windows.
+	bool IsSmbReachable(const std::wstring& Server, unsigned TimeoutMs);
 }
 
 #endif // __NETDISCOVERY_HPP__

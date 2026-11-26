@@ -1161,6 +1161,8 @@ bool NetBrowser::ChangeToDirectory(const wchar_t* Dir, OPERATION_MODES opmodes, 
 						0,
 						0);
 
+				// The user has had the answer: SetDirectory mustn't go and ask the network all over again.
+				SetLastError(ERROR_CANCELLED);
 				return false;
 			}
 		}

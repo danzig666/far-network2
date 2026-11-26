@@ -5,6 +5,12 @@ A drop-in replacement for the `Network.dll` of Far Manager that doesn't freeze F
 - **Computers are found through WS-Discovery as well,** the protocol of Explorer's Network folder. The legacy browser the stock plugin relies on is gone from most networks.
 - **Lists are cached,** also across restarts, and refreshed in the background. Ctrl+R rescans.
 
+## New in 3.0.109
+
+- **Finds computers that have network discovery turned off** but share files: a NetBIOS query goes to every address of the local subnets (up to a /22) alongside WS-Discovery.
+- **Waits longer for WS-Discovery answers** (4 s, three probes): Windows computers often answer only after 2 s or more, and some were missed.
+- **No more half-minute wait on a computer whose firewall blocks file sharing:** Enter says "The network path was not found" within 2 s instead of 40 s, and doesn't start another wait once you've closed the error.
+
 ## Install
 
 Download `far-network2-*.zip` (not the `-symbols` one) and extract it. Close Far, then in the extracted folder run:
@@ -24,7 +30,7 @@ Run end to end on Far 3.0.6699 x64.
 **Not run yet:**
 - the x86 build (it compiles and its exports are correct)
 - mapping and disconnecting drives
-- the password prompt
+- typing into the password prompt (it does come up)
 - adding and removing favorites
 - a network with a working browse server
 

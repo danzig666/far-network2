@@ -68,7 +68,14 @@ installed, and the existing language files, help and settings keep working.
   to the list when it turns up. That can be a minute later. It isn't asked again for
   24 hours after it fails, unless you press Ctrl+R.
 - Opening a domain or the Windows network now sends a WS-Discovery multicast probe,
-  as Explorer does, and asks each responding computer for its name over HTTP.
+  as Explorer does, and asks each responding computer for its name over HTTP. It also
+  sends a NetBIOS name query to every address of the local IPv4 subnets (up to a /22),
+  which finds computers that share files with network discovery turned off. Those
+  that don't run the file server service aren't listed.
+- Before connecting to a computer, the plugin checks that it accepts connections on the
+  SMB ports (445 or 139). A computer whose firewall drops them, typically because file
+  sharing is off or its network is set to Public, fails with `The network path was not
+  found` within 2 seconds instead of the half a minute or more Windows takes.
   **Scan network** in the plugin's settings turns this off along with the rest of
   the scanning.
 - Discovery lists whatever answers on the LAN and says it's a computer. That's no

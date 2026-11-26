@@ -100,6 +100,37 @@ namespace TestHooks
 
 namespace NetApi
 {
+	// How long a computer gets to accept a connection on the SMB ports. On a LAN it takes milliseconds.
+	static const unsigned SmbKnockMs = 2000;
+
+	// "\\NAME\share\dir" -> "NAME", empty if it isn't a UNC path.
+	static string ServerOf(const string& Remote)
+	{
+		if (Remote.size() < 3 || Remote.compare(0, 2, L"\\\\") != 0)
+			return {};
+
+		return Remote.substr(2, Remote.find_first_of(L"\\/", 2) - 2);
+	}
+
+	// Windows takes half a minute or more, per attempt, to give up on a computer whose firewall
+	// drops the SMB ports, and then says ERROR_BAD_NETPATH. Knocking first gets that answer at once.
+	static bool KnockSmb(const string& Remote)
+	{
+		const auto Server = ServerOf(Remote);
+
+		if (Server.empty() || Discovery::IsSmbReachable(Server, SmbKnockMs))
+			return true;
+
+		SetLastError(ERROR_BAD_NETPATH);
+		return false;
+	}
+
+	static bool IsSmbResource(const NetResource& Res)
+	{
+		return (Res.dwDisplayType == RESOURCEDISPLAYTYPE_SERVER || Res.dwDisplayType == RESOURCEDISPLAYTYPE_SHARE) &&
+			(Res.lpProvider.empty() || Res.lpProvider.find(L"Microsoft Windows") != string::npos);
+	}
+
 	DWORD EnumResources(DWORD Scope, DWORD Type, DWORD Usage, const NetResource* Parent, const ResourceSink& Sink)
 	{
 #ifdef NETWORK_TEST_HOOKS
@@ -219,6 +250,9 @@ namespace NetApi
 		TestHooks::Delay();
 #endif
 
+		if (!KnockSmb(Name))
+			return false;
+
 		NETRESOURCE Source{};
 		Source.dwDisplayType = RESOURCEDISPLAYTYPE_GENERIC;
 		Source.dwScope = RESOURCE_GLOBALNET;
@@ -328,6 +362,9 @@ namespace NetApi
 		TestHooks::Delay();
 #endif
 
+		if (!KnockSmb(Remote))
+			return false;
+
 		string Mask;
 
 		if (Remote.compare(0, 2, L"\\\\") == 0)
@@ -375,6 +412,9 @@ namespace NetApi
 		}
 		TestHooks::Delay();
 #endif
+
+		if (IsSmbResource(Res) && !KnockSmb(Res.lpRemoteName))
+			return false;
 
 		auto NetRes = Res.getNETRESOURCE();
 		HANDLE Enum = INVALID_HANDLE_VALUE;
@@ -786,31 +826,44 @@ namespace Scanner
 		return Res;
 	}
 
+	static void AddComputer(const std::shared_ptr<ScanJob>& Job, const Request& Req, const Discovery::Computer& Found, const string& Address)
+	{
+		if (Req.Resource.dwDisplayType == RESOURCEDISPLAYTYPE_NETWORK)
+		{
+			if (!Found.Workgroup.empty())
+			{
+				auto Name = Found.Workgroup;
+				CharUpperBuffW(&Name[0], static_cast<DWORD>(Name.size()));
+				Job->Add({MakeDiscovered(Req, RESOURCEDISPLAYTYPE_DOMAIN, Name, {})});
+			}
+		}
+		else if (!Found.Name.empty())
+		{
+			auto Name = Found.Name;
+			CharUpperBuffW(&Name[0], static_cast<DWORD>(Name.size()));
+			auto Comment = Address;
+			if (!Found.Workgroup.empty())
+				Comment += L" (" + Found.Workgroup + L")";
+			Job->Add({MakeDiscovered(Req, RESOURCEDISPLAYTYPE_SERVER, L"\\\\" + Name, Comment)});
+		}
+	}
+
 	static void IdentifyComputer(const std::shared_ptr<ScanJob>& Job, const std::shared_ptr<const Request>& Req, const Discovery::Responder& Target)
 	{
 		if (!Job->Cancelled)
-		{
-			const auto Found = Discovery::Identify(Target);
+			AddComputer(Job, *Req, Discovery::Identify(Target), Target.Address);
 
-			if (Req->Resource.dwDisplayType == RESOURCEDISPLAYTYPE_NETWORK)
-			{
-				if (!Found.Workgroup.empty())
-				{
-					auto Name = Found.Workgroup;
-					CharUpperBuffW(&Name[0], static_cast<DWORD>(Name.size()));
-					Job->Add({MakeDiscovered(*Req, RESOURCEDISPLAYTYPE_DOMAIN, Name, {})});
-				}
-			}
-			else if (!Found.Name.empty())
-			{
-				auto Name = Found.Name;
-				CharUpperBuffW(&Name[0], static_cast<DWORD>(Name.size()));
-				auto Comment = Target.Address;
-				if (!Found.Workgroup.empty())
-					Comment += L" (" + Found.Workgroup + L")";
-				Job->Add({MakeDiscovered(*Req, RESOURCEDISPLAYTYPE_SERVER, L"\\\\" + Name, Comment)});
-			}
-		}
+		Job->Finish(NO_ERROR);
+	}
+
+	// Computers that share files with network discovery turned off don't answer WS-Discovery,
+	// but most still answer NetBIOS, as Explorer's Network folder finds out the same way.
+	static void SweepNetBios(const std::shared_ptr<ScanJob>& Job, const std::shared_ptr<const Request>& Req)
+	{
+		Discovery::NetBiosSweep([&Job]{ return Job->Cancelled.load(); }, [&](Discovery::Computer&& Found, std::wstring&& Address)
+		{
+			AddComputer(Job, *Req, Found, Address);
+		});
 
 		Job->Finish(NO_ERROR);
 	}
@@ -827,6 +880,10 @@ namespace Scanner
 #endif
 
 		size_t Count = 0;
+
+		++Job->Workers;
+		if (!StartWorker([Job, Req]{ SweepNetBios(Job, Req); }))
+			Job->Finish(NO_ERROR);
 
 		Discovery::Probe([&Job]{ return Job->Cancelled.load(); }, [&](Discovery::Responder&& Target)
 		{
@@ -848,6 +905,15 @@ namespace Scanner
 	{
 		const auto Parent = Req.HasResource? &Req.Resource : nullptr;
 		const auto Sink = [&Job](std::vector<NetResource>&& Batch) { return Job->Add(std::move(Batch)); };
+
+#ifdef NETWORK_TEST_HOOKS
+		if (!TestHooks::Fake())
+#endif
+		if (Parent && NetApi::IsSmbResource(*Parent) && !NetApi::KnockSmb(Parent->lpRemoteName))
+		{
+			Job->Finish(GetLastError());
+			return;
+		}
 
 		auto Error = NetApi::EnumResources(RESOURCE_GLOBALNET, RESOURCETYPE_ANY, 0, Parent, Sink);
 

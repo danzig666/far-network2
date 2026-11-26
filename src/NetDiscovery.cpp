@@ -3,8 +3,16 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <rpc.h>
+#include <iphlpapi.h>
+#include <mstcpip.h>
+
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
 
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -13,8 +21,14 @@
 
 namespace
 {
-	const ULONGLONG ListenMs = 2500;
+	// Windows computers often take two seconds or more to answer a probe.
+	const ULONGLONG ListenMs = 4000;
 	const ULONGLONG ResendMs = 400;
+	const int ProbeSends = 3;
+
+	const ULONGLONG NetBiosListenMs = 1500;
+	// Subnets bigger than this (a /22) aren't swept: that's no longer a LAN worth a packet per address.
+	const unsigned MaxSweepHosts = 1022;
 	const size_t MaxReplySize = 256 * 1024;
 
 	const char ProbeTemplate[] =
@@ -215,6 +229,149 @@ namespace
 		return Result;
 	}
 
+	struct Subnet
+	{
+		in_addr Local;
+		unsigned long First; // host order
+		unsigned long Last;
+	};
+
+	std::vector<Subnet> LocalSubnets()
+	{
+		std::vector<Subnet> Result;
+		ULONG Size = 16 * 1024;
+		std::vector<BYTE> Buffer;
+		ULONG Error;
+
+		do
+		{
+			Buffer.resize(Size);
+			Error = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr,
+				reinterpret_cast<IP_ADAPTER_ADDRESSES*>(Buffer.data()), &Size);
+		}
+		while (Error == ERROR_BUFFER_OVERFLOW);
+
+		if (Error != NO_ERROR)
+			return Result;
+
+		for (auto* Adapter = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(Buffer.data()); Adapter; Adapter = Adapter->Next)
+		{
+			if (Adapter->OperStatus != IfOperStatusUp || Adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK || Adapter->IfType == IF_TYPE_TUNNEL)
+				continue;
+
+			for (auto* Unicast = Adapter->FirstUnicastAddress; Unicast; Unicast = Unicast->Next)
+			{
+				if (Unicast->Address.lpSockaddr->sa_family != AF_INET)
+					continue;
+
+				const auto Prefix = Unicast->OnLinkPrefixLength;
+				if (Prefix < 22 || Prefix > 30)
+					continue;
+
+				const auto Local = reinterpret_cast<const sockaddr_in*>(Unicast->Address.lpSockaddr)->sin_addr;
+				const auto Host = ntohl(Local.s_addr);
+
+				// Link-local: whatever is there isn't reachable by name anyway.
+				if ((Host >> 16) == 0xA9FE)
+					continue;
+
+				const auto Mask = ~0ul << (32 - Prefix);
+				Subnet Net;
+				Net.Local = Local;
+				Net.First = (Host & Mask) + 1;
+				Net.Last = (Host | ~Mask) - 1;
+
+				if (Net.Last >= Net.First && Net.Last - Net.First < MaxSweepHosts)
+					Result.push_back(Net);
+			}
+		}
+
+		return Result;
+	}
+
+	// RFC 1002 node status request for the wildcard name "*".
+	std::string NodeStatusRequest(unsigned short Id)
+	{
+		std::string Packet;
+		Packet += static_cast<char>(Id >> 8);
+		Packet += static_cast<char>(Id & 0xFF);
+		Packet.append("\0\0\0\x01\0\0\0\0\0\0", 10);
+		Packet += '\x20';
+		Packet += "CK";
+		Packet.append(30, 'A');
+		Packet += '\0';
+		Packet.append("\0\x21\0\x01", 4);
+		return Packet;
+	}
+
+	std::wstring NetBiosName(const unsigned char* Name)
+	{
+		char Text[16]{};
+		memcpy(Text, Name, 15);
+		std::string Narrow(Text);
+		Narrow.erase(Narrow.find_last_not_of(' ') + 1);
+
+		if (Narrow.empty())
+			return {};
+
+		const auto Size = MultiByteToWideChar(CP_OEMCP, 0, Narrow.data(), static_cast<int>(Narrow.size()), nullptr, 0);
+		std::wstring Result(Size, L'\0');
+		MultiByteToWideChar(CP_OEMCP, 0, Narrow.data(), static_cast<int>(Narrow.size()), &Result[0], Size);
+		return Result;
+	}
+
+	bool ParseNodeStatus(const char* Data, int Size, unsigned short Id, std::wstring& Name, std::wstring& Group)
+	{
+		const auto* Bytes = reinterpret_cast<const unsigned char*>(Data);
+
+		// A response to our request, with one answer
+		if (Size < 12 || ((Bytes[0] << 8) | Bytes[1]) != Id || !(Bytes[2] & 0x80) || ((Bytes[6] << 8) | Bytes[7]) < 1)
+			return false;
+
+		size_t Pos = 12;
+
+		if (Pos < static_cast<size_t>(Size) && (Bytes[Pos] & 0xC0) == 0xC0)
+			Pos += 2;
+		else
+		{
+			while (Pos < static_cast<size_t>(Size) && Bytes[Pos])
+				Pos += Bytes[Pos] + 1;
+			++Pos;
+		}
+
+		// type, class, TTL, length, then the number of names
+		Pos += 10;
+		if (Pos >= static_cast<size_t>(Size))
+			return false;
+
+		const auto Count = Bytes[Pos++];
+		if (Pos + Count * 18 > static_cast<size_t>(Size))
+			return false;
+
+		for (unsigned I = 0; I < Count; ++I, Pos += 18)
+		{
+			const auto Suffix = Bytes[Pos + 15];
+			const bool IsGroup = (Bytes[Pos + 16] & 0x80) != 0;
+
+			if (!IsGroup && Suffix == 0x20 && Name.empty())
+				Name = NetBiosName(Bytes + Pos);
+			else if (IsGroup && Suffix == 0x00 && Group.empty())
+				Group = NetBiosName(Bytes + Pos);
+		}
+
+		return !Name.empty();
+	}
+
+	std::mutex AddressLock;
+	std::map<std::wstring, std::wstring> Addresses; // upper case name -> IPv4 address
+
+	std::wstring UpperCase(std::wstring Text)
+	{
+		if (!Text.empty())
+			CharUpperBuffW(&Text[0], static_cast<DWORD>(Text.size()));
+		return Text;
+	}
+
 	class WinHttpHandle
 	{
 	public:
@@ -281,7 +438,7 @@ namespace Discovery
 				break;
 
 			// UDP: send again in case the first one got lost. The MessageID is the same, so nobody answers twice.
-			if (Sends < 2 && Elapsed >= ResendMs * Sends)
+			if (Sends < ProbeSends && Elapsed >= ResendMs * Sends)
 			{
 				++Sends;
 				for (const auto Socket: Sockets)
@@ -402,6 +559,7 @@ namespace Discovery
 			return Result;
 
 		Result.Name = Name;
+		RememberAddress(Name, Target.Address);
 
 		if (Slash != std::wstring::npos)
 		{
@@ -415,5 +573,268 @@ namespace Discovery
 		}
 
 		return Result;
+	}
+
+	void NetBiosSweep(const std::function<bool()>& IsCancelled, const std::function<void(Computer&&, std::wstring&& Address)>& Found)
+	{
+		WSADATA Wsa;
+		if (WSAStartup(MAKEWORD(2, 2), &Wsa) != 0)
+			return;
+
+		struct Sweep
+		{
+			SOCKET Socket;
+			Subnet Net;
+		};
+
+		std::vector<Sweep> Sweeps;
+		const auto Id = static_cast<unsigned short>(GetTickCount64() & 0xFFFF);
+		const auto Request = NodeStatusRequest(Id);
+
+		for (const auto& Net: LocalSubnets())
+		{
+			const auto Socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+			if (Socket == INVALID_SOCKET)
+				continue;
+
+			sockaddr_in Local{};
+			Local.sin_family = AF_INET;
+			Local.sin_addr = Net.Local;
+
+			if (bind(Socket, reinterpret_cast<const sockaddr*>(&Local), sizeof(Local)) != 0)
+			{
+				closesocket(Socket);
+				continue;
+			}
+
+			// Otherwise every "port unreachable" from a computer without NetBIOS fails the next recvfrom.
+			BOOL ReportReset = FALSE;
+			DWORD Returned = 0;
+			WSAIoctl(Socket, SIO_UDP_CONNRESET, &ReportReset, sizeof(ReportReset), nullptr, 0, &Returned, nullptr, nullptr);
+
+			Sweeps.push_back({Socket, Net});
+		}
+
+		std::set<unsigned long> Seen;
+		char Buffer[2048];
+
+		const auto Receive = [&](unsigned TimeoutMs)
+		{
+			fd_set Read;
+			FD_ZERO(&Read);
+			for (const auto& i: Sweeps)
+				FD_SET(i.Socket, &Read);
+
+			timeval Timeout{0, static_cast<long>(TimeoutMs * 1000)};
+			if (select(0, &Read, nullptr, nullptr, &Timeout) <= 0)
+				return;
+
+			for (const auto& i: Sweeps)
+			{
+				if (!FD_ISSET(i.Socket, &Read))
+					continue;
+
+				sockaddr_in From{};
+				int FromSize = sizeof(From);
+				const auto Size = recvfrom(i.Socket, Buffer, sizeof(Buffer), 0, reinterpret_cast<sockaddr*>(&From), &FromSize);
+
+				const auto Host = ntohl(From.sin_addr.s_addr);
+				if (Size <= 0 || ntohs(From.sin_port) != 137 || Host < i.Net.First || Host > i.Net.Last || !Seen.insert(Host).second)
+					continue;
+
+				Computer Result;
+				if (!ParseNodeStatus(Buffer, Size, Id, Result.Name, Result.Workgroup) || !IsSaneName(Result.Name))
+					continue;
+
+				if (!IsSaneName(Result.Workgroup))
+					Result.Workgroup.clear();
+
+				char AddressText[INET_ADDRSTRLEN]{};
+				if (!inet_ntop(AF_INET, &From.sin_addr, AddressText, sizeof(AddressText)))
+					continue;
+
+				auto Address = ToWide(AddressText);
+				RememberAddress(Result.Name, Address);
+				Found(std::move(Result), std::move(Address));
+			}
+		};
+
+		for (const auto& i: Sweeps)
+		{
+			const auto Self = ntohl(i.Net.Local.s_addr);
+
+			for (auto Host = i.Net.First; Host <= i.Net.Last && !IsCancelled(); ++Host)
+			{
+				if (Host == Self)
+					continue;
+
+				sockaddr_in To{};
+				To.sin_family = AF_INET;
+				To.sin_port = htons(137);
+				To.sin_addr.s_addr = htonl(Host);
+				sendto(i.Socket, Request.data(), static_cast<int>(Request.size()), 0, reinterpret_cast<const sockaddr*>(&To), sizeof(To));
+
+				// Don't flood the switch, and pick up the answers as they come.
+				if ((Host & 0x3F) == 0)
+					Receive(5);
+			}
+		}
+
+		const auto Start = GetTickCount64();
+		while (!Sweeps.empty() && !IsCancelled() && GetTickCount64() - Start < NetBiosListenMs)
+			Receive(100);
+
+		for (const auto& i: Sweeps)
+			closesocket(i.Socket);
+
+		WSACleanup();
+	}
+
+	void RememberAddress(const std::wstring& Name, const std::wstring& Address)
+	{
+		std::lock_guard<std::mutex> Lock(AddressLock);
+		Addresses[UpperCase(Name)] = Address;
+	}
+
+	bool IsSmbReachable(const std::wstring& Server, unsigned TimeoutMs)
+	{
+		// Not a plain computer name: \\server@SSL\..., \\?\..., and the like are someone else's business.
+		if (Server.empty() || Server.find_first_of(L"@?") != std::wstring::npos)
+			return true;
+
+		WSADATA Wsa;
+		if (WSAStartup(MAKEWORD(2, 2), &Wsa) != 0)
+			return true;
+
+		std::vector<sockaddr_storage> Targets;
+
+		const auto AddTargets = [&Targets](const wchar_t* Host)
+		{
+			addrinfoW Hints{};
+			Hints.ai_socktype = SOCK_STREAM;
+			Hints.ai_protocol = IPPROTO_TCP;
+			addrinfoW* Info = nullptr;
+
+			if (GetAddrInfoW(Host, nullptr, &Hints, &Info) != 0)
+				return;
+
+			for (auto* i = Info; i; i = i->ai_next)
+			{
+				if ((i->ai_family != AF_INET && i->ai_family != AF_INET6) || i->ai_addrlen > sizeof(sockaddr_storage))
+					continue;
+
+				sockaddr_storage Address{};
+				memcpy(&Address, i->ai_addr, i->ai_addrlen);
+				Targets.push_back(Address);
+			}
+
+			FreeAddrInfoW(Info);
+		};
+
+		std::wstring Known;
+		{
+			std::lock_guard<std::mutex> Lock(AddressLock);
+			const auto Found = Addresses.find(UpperCase(Server));
+			if (Found != Addresses.end())
+				Known = Found->second;
+		}
+
+		if (!Known.empty())
+			AddTargets(Known.c_str());
+		AddTargets(Server.c_str());
+
+		if (Targets.empty())
+		{
+			WSACleanup();
+			return true;
+		}
+
+		std::vector<SOCKET> Pending;
+		bool Reachable = false;
+
+		for (const auto& Target: Targets)
+		{
+			for (const unsigned short Port: {445, 139})
+			{
+				auto Address = Target;
+				int AddressSize;
+
+				if (Address.ss_family == AF_INET)
+				{
+					reinterpret_cast<sockaddr_in*>(&Address)->sin_port = htons(Port);
+					AddressSize = sizeof(sockaddr_in);
+				}
+				else
+				{
+					reinterpret_cast<sockaddr_in6*>(&Address)->sin6_port = htons(Port);
+					AddressSize = sizeof(sockaddr_in6);
+				}
+
+				const auto Socket = socket(Address.ss_family, SOCK_STREAM, IPPROTO_TCP);
+				if (Socket == INVALID_SOCKET)
+					continue;
+
+				u_long NonBlocking = 1;
+				ioctlsocket(Socket, FIONBIO, &NonBlocking);
+
+				if (connect(Socket, reinterpret_cast<const sockaddr*>(&Address), AddressSize) == 0)
+				{
+					Reachable = true;
+					closesocket(Socket);
+					break;
+				}
+
+				if (WSAGetLastError() == WSAEWOULDBLOCK)
+					Pending.push_back(Socket);
+				else
+					closesocket(Socket);
+			}
+
+			if (Reachable)
+				break;
+		}
+
+		const auto Start = GetTickCount64();
+
+		while (!Reachable && !Pending.empty())
+		{
+			const auto Elapsed = GetTickCount64() - Start;
+			if (Elapsed >= TimeoutMs)
+				break;
+
+			fd_set Write, Failed;
+			FD_ZERO(&Write);
+			FD_ZERO(&Failed);
+			for (const auto Socket: Pending)
+			{
+				FD_SET(Socket, &Write);
+				FD_SET(Socket, &Failed);
+			}
+
+			const auto Left = TimeoutMs - Elapsed;
+			timeval Timeout{static_cast<long>(Left / 1000), static_cast<long>(Left % 1000 * 1000)};
+			if (select(0, nullptr, &Write, &Failed, &Timeout) <= 0)
+				break;
+
+			for (auto i = Pending.begin(); i != Pending.end();)
+			{
+				if (FD_ISSET(*i, &Write))
+					Reachable = true;
+
+				if (FD_ISSET(*i, &Write) || FD_ISSET(*i, &Failed))
+				{
+					closesocket(*i);
+					i = Pending.erase(i);
+				}
+				else
+					++i;
+			}
+		}
+
+		for (const auto Socket: Pending)
+			closesocket(Socket);
+
+		WSACleanup();
+		return Reachable;
 	}
 }

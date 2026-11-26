@@ -1,6 +1,6 @@
 ﻿#include <farversion.hpp>
 
-#define PLUGIN_BUILD 108
+#define PLUGIN_BUILD 109
 #define PLUGIN_DESC L"Network Plugin for Far Manager"
 #define PLUGIN_NAME L"Network"
 #define PLUGIN_FILENAME L"Network.dll"
